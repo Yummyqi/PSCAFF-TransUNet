@@ -401,26 +401,93 @@ class CoordAtt(nn.Module):
 
         return x * y_h * y_w.permute(0, 1, 3, 2)
 
-class DecoderBlock(nn.Module):
+# class DecoderBlock(nn.Module):
+#     def __init__(
+#             self,
+#             in_channels,
+#             out_channels,
+#             skip_channels=0,
+#             use_batchnorm=True,
+#     ):
+#         super().__init__()
+#         self.conv1 = Conv2dReLU(
+#             in_channels + skip_channels,
+#             out_channels,
+#             kernel_size=3,
+#             padding=1,
+#             use_batchnorm=use_batchnorm,
+#         )
+
+#         # 坐标注意力模块
+#         self.coord_att = CoordAtt(out_channels)
+
+#         self.conv2 = Conv2dReLU(
+#             out_channels,
+#             out_channels,
+#             kernel_size=3,
+#             padding=1,
+#             use_batchnorm=use_batchnorm,
+#         )
+#         # # 初始化一个上采样模块，如双线性插值或者子像素卷积（Transposed Convolution）
+#          self.up = nn.UpsamplingBilinear2d(scale_factor=2)
+
+# #-----------------实例化GLI模块------------------
+#         # if skip_channels != 0:
+#         #     self.gli = EATBlock(emb_dim=skip_channels)
+
+#         # 初始化CCNetplus实例
+#         self.ccnetplus = CCNetPlus(in_channels=out_channels, out_channels=out_channels)
+
+#     def forward(self, x, skip=None):
+#         # k = x
+#         # gating = self.gating(k) # 对最后一个下采样后的特征图设置为门控信号g
+#         # gating = self.up(gating)
+#         # print("skip[1]:",skip.shape[1])
+#         # skip, attn = self.gate_attention_layer(skip, gating)
+
+#         # x = self.up(x)
+
+#         if skip is not None:
+
+# #-----------------------引入GLI 和 Attention Gate-----------------------
+#             # skip = self.gli(skip)
+#             # x = self.gate_attention(x, skip)
+#             # x, att = self.gate_attention_layer(x, skip)
+# #----------------------------------------------------------------------
+
+#             x = torch.cat([x, skip], dim=1)
+#         x = self.conv1(x)
+#         x = self.conv2(x) # 1*1
+#         return x
+
+class DecoderBlockProgressive(nn.Module):
     def __init__(
             self,
-            in_channels,
-            out_channels,
-            skip_channels=0,
+            in_channels,          # 输入通道数（低分辨率特征）
+            out_channels,         # 输出通道数
+            skip_channels=0,      # 跳跃连接通道数（没有则为0）
             use_batchnorm=True,
     ):
         super().__init__()
+        self.skip_channels = skip_channels
+
+        # Pixel Shuffle 上采样部分（固定 2 倍上采样）
+        self.pixel_shuffle_conv = nn.Conv2d(in_channels, out_channels * 4, kernel_size=1)
+        self.pixel_shuffle = nn.PixelShuffle(2)
+
+        # 第一个卷积：融合 skip 后，将通道数压缩回 out_channels
         self.conv1 = Conv2dReLU(
-            in_channels + skip_channels,
+            out_channels + skip_channels,
             out_channels,
             kernel_size=3,
             padding=1,
             use_batchnorm=use_batchnorm,
         )
 
-        # 坐标注意力模块
+        # 坐标注意力（放在两个卷积之间）
         self.coord_att = CoordAtt(out_channels)
 
+        # 第二个卷积
         self.conv2 = Conv2dReLU(
             out_channels,
             out_channels,
@@ -428,48 +495,22 @@ class DecoderBlock(nn.Module):
             padding=1,
             use_batchnorm=use_batchnorm,
         )
-        # # 初始化一个上采样模块，如双线性插值或者子像素卷积（Transposed Convolution）
-        # self.up = nn.UpsamplingBilinear2d(scale_factor=2)
-        
-        # Pixel Shuffle 上采样部分
-        self.pixel_shuffle_conv = nn.Conv2d(in_channels, out_channels * 4, kernel_size=1)
-        self.pixel_shuffle = nn.PixelShuffle(2)
-
-#-----------------实例化GLI模块------------------
-        # if skip_channels != 0:
-        #     self.gli = EATBlock(emb_dim=skip_channels)
-
-        # 初始化CCNetplus实例
-        self.ccnetplus = CCNetPlus(in_channels=out_channels, out_channels=out_channels)
 
     def forward(self, x, skip=None):
-        # k = x
-        # gating = self.gating(k) # 对最后一个下采样后的特征图设置为门控信号g
-        # gating = self.up(gating)
-        # print("skip[1]:",skip.shape[1])
-        # skip, attn = self.gate_attention_layer(skip, gating)
-
-        # x = self.up(x)
-
-        # 1. Pixel Shuffle 上采样
+        # 1. Pixel Shuffle 上采样（自动处理尺寸）
         x = self.pixel_shuffle_conv(x)      # (B, out*4, H, W)
         x = self.pixel_shuffle(x)           # (B, out, 2H, 2W)
 
+        # 2. 融合跳跃连接（如果存在）
         if skip is not None:
+            x = torch.cat([x, skip], dim=1)   # (B, out+skip_c, 2H, 2W)
 
-#-----------------------引入GLI 和 Attention Gate-----------------------
-            # skip = self.gli(skip)
-            # x = self.gate_attention(x, skip)
-            # x, att = self.gate_attention_layer(x, skip)
-#----------------------------------------------------------------------
-
-            x = torch.cat([x, skip], dim=1)
-        x = self.conv1(x)
-        x = self.coord_att(x)               # 坐标注意力增强
-        x = self.conv2(x) # 1*1
+        # 3. 卷积1 -> 坐标注意力 -> 卷积2
+        x = self.conv1(x)                   # (B, out, 2H, 2W)
+        x = self.coord_att(x)               # 坐标注意力增强空间结构
+        x = self.conv2(x)                   # (B, out, 2H, 2W)
 
         return x
-
 
 class SegmentationHead(nn.Sequential): # 作用是将图像分类任务的输出适应为图像分割任务的输出
 
@@ -511,7 +552,8 @@ class DecoderCup(nn.Module): # 级联上采样
             skip_channels=[0,0,0,0]
 
         blocks = [
-            DecoderBlock(in_ch, out_ch, sk_ch) for in_ch, out_ch, sk_ch in zip(in_channels, out_channels, skip_channels)
+            # DecoderBlock(in_ch, out_ch, sk_ch) for in_ch, out_ch, sk_ch in zip(in_channels, out_channels, skip_channels)
+            DecoderBlockProgressive(in_ch, out_ch, sk_ch) for in_ch, out_ch, sk_ch in zip(in_channels, out_channels, skip_channels)
         ]
         self.blocks = nn.ModuleList(blocks)
 
@@ -526,17 +568,6 @@ class DecoderCup(nn.Module): # 级联上采样
                    最后输出的x:(B,16,H,W)=(B,16,224,224)
         '''
         self.se_layers_fusion = SELayer(in_channel=768, out_channel=768, reduction=8)
-        # self.se_layer = PSPPSEPreActBlock(in_planes=768, planes=768, reduction=8)
-
-
-        # self.cbam = CBAM(c1=512)
-        # self.simam = SimAM()
-
-        # 初始化CCNet实例
-        # self.ccnet = CCNet(in_channels=768, out_channels=768)
-
-        # 初始化CCNetplus实例
-        # self.ccnetplus = CCNetPlus(in_channels=skip_channels, out_channels=skip_channels)
 
     def forward(self, hidden_states, features=None):
 
