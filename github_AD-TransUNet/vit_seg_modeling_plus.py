@@ -374,6 +374,33 @@ class Conv2dReLU(nn.Sequential):
         super(Conv2dReLU, self).__init__(conv, bn, relu)
 
 
+class CoordAtt(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        super().__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        self.conv1 = nn.Conv2d(in_channels, in_channels // reduction, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(in_channels // reduction)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv_h = nn.Conv2d(in_channels // reduction, in_channels, kernel_size=1)
+        self.conv_w = nn.Conv2d(in_channels // reduction, in_channels, kernel_size=1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_h = self.pool_h(x)                     # (B, C, H, 1)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2) # (B, C, 1, W) -> (B, C, W, 1)
+
+        y = torch.cat([x_h, x_w], dim=2)         # (B, C, H+W, 1)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.relu(y)
+
+        y_h, y_w = torch.split(y, [H, W], dim=2)
+        y_h = self.conv_h(y_h).sigmoid()          # (B, C, H, 1)
+        y_w = self.conv_w(y_w).sigmoid()          # (B, C, W, 1)
+
+        return x * y_h * y_w.permute(0, 1, 3, 2)
+
 class DecoderBlock(nn.Module):
     def __init__(
             self,
@@ -390,6 +417,10 @@ class DecoderBlock(nn.Module):
             padding=1,
             use_batchnorm=use_batchnorm,
         )
+
+        # 坐标注意力模块
+        self.coord_att = CoordAtt(out_channels)
+
         self.conv2 = Conv2dReLU(
             out_channels,
             out_channels,
@@ -397,18 +428,12 @@ class DecoderBlock(nn.Module):
             padding=1,
             use_batchnorm=use_batchnorm,
         )
-        # 初始化一个上采样模块，如双线性插值或者子像素卷积（Transposed Convolution）
-        self.up = nn.UpsamplingBilinear2d(scale_factor=2)
-
-        # print(in_channels, skip_channels, out_channels, out_channels // 2)
-        # self.gate_attention = GateAttention(in_channels, skip_channels, out_channels // 2)
-
-        # self.gating = UnetGridGatingSignal2(in_size=in_channels,out_size=skip_channels,kernel_size=(1,1))
-
-        # self.adjust_channels_to_128 = nn.Conv2d(in_channels=64, out_channels=128,
-        #                                             kernel_size=1)  # in_channels需要你根据实际情况填写
-
-        # self.gate_attention_layer = GridAttentionBlock2D(in_channels, skip_channels)
+        # # 初始化一个上采样模块，如双线性插值或者子像素卷积（Transposed Convolution）
+        # self.up = nn.UpsamplingBilinear2d(scale_factor=2)
+        
+        # Pixel Shuffle 上采样部分
+        self.pixel_shuffle_conv = nn.Conv2d(in_channels, out_channels * 4, kernel_size=1)
+        self.pixel_shuffle = nn.PixelShuffle(2)
 
 #-----------------实例化GLI模块------------------
         # if skip_channels != 0:
@@ -424,7 +449,12 @@ class DecoderBlock(nn.Module):
         # print("skip[1]:",skip.shape[1])
         # skip, attn = self.gate_attention_layer(skip, gating)
 
-        x = self.up(x)
+        # x = self.up(x)
+
+        # 1. Pixel Shuffle 上采样
+        x = self.pixel_shuffle_conv(x)      # (B, out*4, H, W)
+        x = self.pixel_shuffle(x)           # (B, out, 2H, 2W)
+
         if skip is not None:
 
 #-----------------------引入GLI 和 Attention Gate-----------------------
@@ -435,6 +465,7 @@ class DecoderBlock(nn.Module):
 
             x = torch.cat([x, skip], dim=1)
         x = self.conv1(x)
+        x = self.coord_att(x)               # 坐标注意力增强
         x = self.conv2(x) # 1*1
 
         return x
